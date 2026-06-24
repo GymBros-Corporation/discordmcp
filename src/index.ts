@@ -292,19 +292,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ].join(' ');
         const content = prefix ? `${prefix} ${message}` : message;
 
+        // Also honor mention markup already present in the message text. Without
+        // this, an explicit allowedMentions list would render those pills but
+        // suppress their notifications. Merge embedded IDs into the allow-list.
+        const embeddedUserIds = [...content.matchAll(/<@!?(\d+)>/g)].map(m => m[1]);
+        const embeddedRoleIds = [...content.matchAll(/<@&(\d+)>/g)].map(m => m[1]);
+        const allUserIds = [...new Set([...userIds, ...embeddedUserIds])];
+        const allRoleIds = [...new Set([...roleIds, ...embeddedRoleIds])];
+        const pingEveryone = mentionEveryone || /@(everyone|here)/.test(content);
+
         const sent = await channel.send({
           content,
           allowedMentions: {
-            users: userIds,
-            roles: roleIds,
-            parse: mentionEveryone ? ['everyone'] : [],
+            users: allUserIds,
+            roles: allRoleIds,
+            parse: pingEveryone ? ['everyone'] : [],
           },
         });
         return {
           content: [{
             type: "text",
             text: `Message sent successfully to #${channel.name} in ${channel.guild.name}. Message ID: ${sent.id}` +
-              (prefix ? ` (pinged ${userIds.length} user(s), ${roleIds.length} role(s)${mentionEveryone ? ', @everyone' : ''})` : ''),
+              ((allUserIds.length || allRoleIds.length || pingEveryone)
+                ? ` (pinged ${allUserIds.length} user(s), ${allRoleIds.length} role(s)${pingEveryone ? ', @everyone' : ''})`
+                : ''),
           }],
         };
       }
