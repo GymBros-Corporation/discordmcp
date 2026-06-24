@@ -17,6 +17,9 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    // Needed to resolve users by name/nickname for pings.
+    // Requires "Server Members Intent" to be enabled in the Discord Developer Portal.
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -91,11 +94,56 @@ async function findChannel(channelIdentifier: string, guildIdentifier?: string):
   throw new Error(`Channel "${channelIdentifier}" is not a text channel or not found in server "${guild.name}"`);
 }
 
+// Resolve a role identifier (ID or name) to a role ID within a guild.
+async function resolveRoleId(guild: import('discord.js').Guild, identifier: string): Promise<string> {
+  const byId = guild.roles.cache.get(identifier);
+  if (byId) return byId.id;
+  const byName = guild.roles.cache.find(
+    r => r.name.toLowerCase() === identifier.toLowerCase().replace(/^@&?/, '')
+  );
+  if (byName) return byName.id;
+  const available = guild.roles.cache
+    .filter(r => r.id !== guild.id)
+    .map(r => `"${r.name}"`).join(', ');
+  throw new Error(`Role "${identifier}" not found in "${guild.name}". Available roles: ${available}`);
+}
+
+// Resolve a user identifier (ID, username, tag, or nickname) to a member ID within a guild.
+async function resolveUserId(guild: import('discord.js').Guild, identifier: string): Promise<string> {
+  const clean = identifier.replace(/^@/, '');
+  // Try direct ID fetch first.
+  try {
+    const member = await guild.members.fetch(clean);
+    if (member) return member.id;
+  } catch {
+    // Not an ID — fall through to name/nickname search.
+  }
+  const matches = await guild.members.fetch({ query: clean, limit: 10 });
+  const exact = matches.find(
+    m => m.user.username.toLowerCase() === clean.toLowerCase() ||
+         m.user.tag.toLowerCase() === clean.toLowerCase() ||
+         (m.nickname?.toLowerCase() === clean.toLowerCase())
+  );
+  if (exact) return exact.id;
+  if (matches.size === 1) return matches.first()!.id;
+  if (matches.size > 1) {
+    const list = matches.map(m => `${m.user.tag} (ID: ${m.id})`).join(', ');
+    throw new Error(`Multiple members match "${identifier}": ${list}. Please specify the user ID.`);
+  }
+  throw new Error(`User "${identifier}" not found in "${guild.name}". Use find-member to search, or pass a user ID.`);
+}
+
 // Updated validation schemas
 const SendMessageSchema = z.object({
   server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
   channel: z.string().describe('Channel name (e.g., "general") or ID'),
   message: z.string(),
+  mentionUsers: z.array(z.string()).optional()
+    .describe('Users to ping (IDs, usernames, tags, or nicknames). Mentions are prepended to the message.'),
+  mentionRoles: z.array(z.string()).optional()
+    .describe('Roles to ping (IDs or names). Role must be mentionable or the bot needs "Mention All Roles" permission.'),
+  mentionEveryone: z.boolean().optional()
+    .describe('Set true to ping @everyone (requires the bot to have the Mention Everyone permission).'),
 });
 
 const ReadMessagesSchema = z.object({
@@ -187,6 +235,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
         },
       },
+      {
+        name: "list-roles",
+        description: "List the roles in a server (with IDs and whether each is mentionable). Use to discover roles before pinging them.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            server: {
+              type: "string",
+              description: 'Server name or ID (optional if bot is only in one server)',
+            },
+          },
+        },
+      },
+      {
+        name: "find-member",
+        description: "Search server members by username, tag, or nickname. Use to find a user's ID before pinging them.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            server: {
+              type: "string",
+              description: 'Server name or ID (optional if bot is only in one server)',
+            },
+            query: {
+              type: "string",
+              description: "Username, nickname, or tag to search for",
+            },
+          },
+          required: ["query"],
+        },
+      },
     ],
   };
 });
@@ -198,14 +277,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "send-message": {
-        const { server: guildIdentifier, channel: channelIdentifier, message } = SendMessageSchema.parse(args);
+        const { server: guildIdentifier, channel: channelIdentifier, message, mentionUsers, mentionRoles, mentionEveryone } = SendMessageSchema.parse(args);
         const channel = await findChannel(channelIdentifier, guildIdentifier);
-        
-        const sent = await channel.send(message);
+
+        // Resolve any requested mentions to IDs so Discord renders real pings.
+        // Raw "@name" text never notifies anyone — only <@id> / <@&id> markup does.
+        const userIds = await Promise.all((mentionUsers ?? []).map(u => resolveUserId(channel.guild, u)));
+        const roleIds = await Promise.all((mentionRoles ?? []).map(r => resolveRoleId(channel.guild, r)));
+
+        const prefix = [
+          ...userIds.map(id => `<@${id}>`),
+          ...roleIds.map(id => `<@&${id}>`),
+          ...(mentionEveryone ? ['@everyone'] : []),
+        ].join(' ');
+        const content = prefix ? `${prefix} ${message}` : message;
+
+        const sent = await channel.send({
+          content,
+          allowedMentions: {
+            users: userIds,
+            roles: roleIds,
+            parse: mentionEveryone ? ['everyone'] : [],
+          },
+        });
         return {
           content: [{
             type: "text",
-            text: `Message sent successfully to #${channel.name} in ${channel.guild.name}. Message ID: ${sent.id}`,
+            text: `Message sent successfully to #${channel.name} in ${channel.guild.name}. Message ID: ${sent.id}` +
+              (prefix ? ` (pinged ${userIds.length} user(s), ${roleIds.length} role(s)${mentionEveryone ? ', @everyone' : ''})` : ''),
           }],
         };
       }
@@ -256,6 +355,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: JSON.stringify({ server: guild.name, channels }, null, 2),
+          }],
+        };
+      }
+
+      case "list-roles": {
+        const { server: guildIdentifier } = z
+          .object({ server: z.string().optional() })
+          .parse(args);
+        const guild = await findGuild(guildIdentifier);
+        const roles = guild.roles.cache
+          .filter(r => r.id !== guild.id) // exclude @everyone
+          .sort((a, b) => b.position - a.position)
+          .map(r => ({ name: r.name, id: r.id, mentionable: r.mentionable }));
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ server: guild.name, roles }, null, 2),
+          }],
+        };
+      }
+
+      case "find-member": {
+        const { server: guildIdentifier, query } = z
+          .object({ server: z.string().optional(), query: z.string() })
+          .parse(args);
+        const guild = await findGuild(guildIdentifier);
+        const members = await guild.members.fetch({ query, limit: 10 });
+        const results = members.map(m => ({
+          id: m.id,
+          username: m.user.username,
+          tag: m.user.tag,
+          nickname: m.nickname ?? null,
+        }));
+        return {
+          content: [{
+            type: "text",
+            text: results.length
+              ? JSON.stringify(results, null, 2)
+              : `No members found matching "${query}" in "${guild.name}".`,
           }],
         };
       }
