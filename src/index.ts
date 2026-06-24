@@ -166,6 +166,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["channel"],
         },
       },
+      {
+        name: "list-servers",
+        description: "List all Discord servers (guilds) the bot is a member of. Use this first to discover available servers.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "list-channels",
+        description: "List the text channels in a server. Use this to discover channel names before reading or sending messages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            server: {
+              type: "string",
+              description: 'Server name or ID (optional if bot is only in one server)',
+            },
+          },
+        },
+      },
     ],
   };
 });
@@ -177,8 +198,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "send-message": {
-        const { channel: channelIdentifier, message } = SendMessageSchema.parse(args);
-        const channel = await findChannel(channelIdentifier);
+        const { server: guildIdentifier, channel: channelIdentifier, message } = SendMessageSchema.parse(args);
+        const channel = await findChannel(channelIdentifier, guildIdentifier);
         
         const sent = await channel.send(message);
         return {
@@ -190,8 +211,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "read-messages": {
-        const { channel: channelIdentifier, limit } = ReadMessagesSchema.parse(args);
-        const channel = await findChannel(channelIdentifier);
+        const { server: guildIdentifier, channel: channelIdentifier, limit } = ReadMessagesSchema.parse(args);
+        const channel = await findChannel(channelIdentifier, guildIdentifier);
         
         const messages = await channel.messages.fetch({ limit });
         const formattedMessages = Array.from(messages.values()).map(msg => ({
@@ -210,18 +231,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "list-servers": {
+        const guilds = Array.from(client.guilds.cache.values())
+          .map(g => ({ name: g.name, id: g.id }));
+        return {
+          content: [{
+            type: "text",
+            text: guilds.length
+              ? JSON.stringify(guilds, null, 2)
+              : "The bot is not a member of any servers.",
+          }],
+        };
+      }
+
+      case "list-channels": {
+        const { server: guildIdentifier } = z
+          .object({ server: z.string().optional() })
+          .parse(args);
+        const guild = await findGuild(guildIdentifier);
+        const channels = guild.channels.cache
+          .filter((c): c is TextChannel => c instanceof TextChannel)
+          .map(c => ({ name: c.name, id: c.id }));
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ server: guild.name, channels }, null, 2),
+          }],
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      throw new Error(
-        `Invalid arguments: ${error.errors
-          .map((e) => `${e.path.join(".")}: ${e.message}`)
-          .join(", ")}`
-      );
-    }
-    throw error;
+    // Return errors as readable tool content (isError) rather than throwing a
+    // protocol-level error, so the client/model can see the message — including
+    // the list of available servers/channels — and recover or ask the user.
+    const message = error instanceof z.ZodError
+      ? `Invalid arguments: ${error.errors.map((e) => `${e.path.join(".")}: ${e.message}`).join(", ")}`
+      : error instanceof Error ? error.message : String(error);
+    return {
+      isError: true,
+      content: [{ type: "text", text: message }],
+    };
   }
 });
 
