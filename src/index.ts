@@ -5,7 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Client, GatewayIntentBits, TextChannel } from 'discord.js';
+import { Client, GatewayIntentBits, TextChannel, SnowflakeUtil, Message } from 'discord.js';
 import { z } from 'zod';
 
 // Load environment variables
@@ -133,6 +133,112 @@ async function resolveUserId(guild: import('discord.js').Guild, identifier: stri
   throw new Error(`User "${identifier}" not found in "${guild.name}". Use find-member to search, or pass a user ID.`);
 }
 
+// Format a Discord message into a rich, analysis-friendly object that includes
+// author IDs, reply references, and mentions — so callers don't need extra
+// round-trips (e.g. find-member) to identify who said or was pinged in what.
+function formatMessage(channel: TextChannel, msg: Message) {
+  return {
+    id: msg.id,
+    channel: `#${channel.name}`,
+    channelId: channel.id,
+    server: channel.guild.name,
+    author: msg.author.tag,
+    authorId: msg.author.id,
+    authorDisplayName: msg.member?.displayName ?? msg.author.username,
+    isBot: msg.author.bot,
+    content: msg.content,
+    timestamp: msg.createdAt.toISOString(),
+    editedTimestamp: msg.editedAt ? msg.editedAt.toISOString() : null,
+    replyToMessageId: msg.reference?.messageId ?? null,
+    mentions: {
+      users: msg.mentions.users.map(u => ({ id: u.id, tag: u.tag })),
+      roles: msg.mentions.roles.map(r => ({ id: r.id, name: r.name })),
+    },
+  };
+}
+
+// Does a message match an author filter (ID, username, tag, or nickname)?
+function authorMatches(msg: Message, author?: string): boolean {
+  if (!author) return true;
+  const a = author.toLowerCase().replace(/^@/, '');
+  return (
+    msg.author.id === author ||
+    msg.author.username.toLowerCase() === a ||
+    msg.author.tag.toLowerCase() === a ||
+    msg.member?.displayName?.toLowerCase() === a ||
+    msg.member?.nickname?.toLowerCase() === a
+  );
+}
+
+// Convert an ISO 8601 timestamp into a Discord snowflake for use as a
+// before/after history bound (snowflakes encode their creation time).
+function timestampToSnowflake(iso: string): string {
+  const ms = new Date(iso).getTime();
+  if (Number.isNaN(ms)) {
+    throw new Error(`Invalid date "${iso}". Use an ISO 8601 string, e.g. "2025-06-01T00:00:00Z".`);
+  }
+  return SnowflakeUtil.generate({ timestamp: ms }).toString();
+}
+
+interface CollectOptions {
+  limit: number;                          // max messages to RETURN (after filters)
+  before?: string;                        // message ID upper bound (older than)
+  after?: string;                         // message ID lower bound (newer than)
+  since?: string;                         // ISO timestamp lower bound
+  until?: string;                         // ISO timestamp upper bound
+  author?: string;                        // author filter
+  contentMatch?: (content: string) => boolean; // keyword predicate (search)
+  maxScan?: number;                       // safety cap on messages fetched
+}
+
+// Fetch channel history with pagination + filtering. Walks backward (newest to
+// oldest) in batches of 100, applying author/time/keyword filters, until it has
+// `limit` matches or hits the scan cap. Returns messages newest-first.
+async function collectMessages(channel: TextChannel, opts: CollectOptions) {
+  const maxScan = opts.maxScan ?? 3000;
+
+  // Upper bound (older-than cursor): the smaller of `before` and `until`.
+  let cursor = opts.before;
+  if (opts.until) {
+    const untilId = timestampToSnowflake(opts.until);
+    cursor = cursor ? (BigInt(cursor) < BigInt(untilId) ? cursor : untilId) : untilId;
+  }
+  // Lower bound (stop when we reach it): the larger of `after` and `since`.
+  let lowerBound: bigint | null = opts.after ? BigInt(opts.after) : null;
+  if (opts.since) {
+    const sinceId = BigInt(timestampToSnowflake(opts.since));
+    lowerBound = lowerBound !== null && lowerBound > sinceId ? lowerBound : sinceId;
+  }
+
+  const results: ReturnType<typeof formatMessage>[] = [];
+  let scanned = 0;
+  let reachedLowerBound = false;
+
+  while (results.length < opts.limit && scanned < maxScan) {
+    const batchSize = Math.min(100, maxScan - scanned);
+    const batch = await channel.messages.fetch({
+      limit: batchSize,
+      ...(cursor ? { before: cursor } : {}),
+    });
+    if (batch.size === 0) break;
+
+    const ordered = [...batch.values()]; // newest -> oldest
+    for (const msg of ordered) {
+      scanned++;
+      if (lowerBound !== null && BigInt(msg.id) <= lowerBound) { reachedLowerBound = true; break; }
+      if (!authorMatches(msg, opts.author)) continue;
+      if (opts.contentMatch && !opts.contentMatch(msg.content)) continue;
+      results.push(formatMessage(channel, msg));
+      if (results.length >= opts.limit) break;
+    }
+
+    cursor = ordered[ordered.length - 1].id; // oldest id seen, for next page
+    if (reachedLowerBound || batch.size < batchSize) break;
+  }
+
+  return { messages: results, scanned, hitScanCap: scanned >= maxScan && results.length < opts.limit };
+}
+
 // Updated validation schemas
 const SendMessageSchema = z.object({
   server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
@@ -149,7 +255,25 @@ const SendMessageSchema = z.object({
 const ReadMessagesSchema = z.object({
   server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
   channel: z.string().describe('Channel name (e.g., "general") or ID'),
-  limit: z.number().min(1).max(100).default(50),
+  limit: z.number().min(1).max(1000).default(50)
+    .describe('Max messages to return. Values over 100 are fetched via pagination.'),
+  before: z.string().optional().describe('Only messages older than this message ID (cursor for paging back through history).'),
+  after: z.string().optional().describe('Only messages newer than this message ID.'),
+  since: z.string().optional().describe('Only messages at/after this ISO 8601 timestamp, e.g. "2025-06-01T00:00:00Z".'),
+  until: z.string().optional().describe('Only messages at/before this ISO 8601 timestamp.'),
+  author: z.string().optional().describe('Filter to a single author (ID, username, tag, or nickname).'),
+});
+
+const SearchMessagesSchema = z.object({
+  server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
+  channel: z.string().optional().describe('Channel name or ID to search. Omit to search all readable text channels in the server.'),
+  query: z.string().describe('Keyword(s) to find. Space-separated terms must ALL appear in a message (case-insensitive).'),
+  limit: z.number().min(1).max(200).default(25).describe('Max matching messages to return.'),
+  author: z.string().optional().describe('Restrict to a single author (ID, username, tag, or nickname).'),
+  since: z.string().optional().describe('Only search messages at/after this ISO 8601 timestamp.'),
+  until: z.string().optional().describe('Only search messages at/before this ISO 8601 timestamp.'),
+  maxScanPerChannel: z.number().min(1).max(5000).default(1000)
+    .describe('Max messages to scan per channel before giving up (keyword search reads history client-side).'),
 });
 
 // Create server instance
@@ -187,13 +311,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Message content to send",
             },
+            mentionUsers: {
+              type: "array",
+              items: { type: "string" },
+              description: "Users to ping (IDs, usernames, tags, or nicknames). Resolved to real mentions and prepended to the message.",
+            },
+            mentionRoles: {
+              type: "array",
+              items: { type: "string" },
+              description: 'Roles to ping (IDs or names). Role must be mentionable or the bot needs "Mention All Roles" permission.',
+            },
+            mentionEveryone: {
+              type: "boolean",
+              description: "Set true to ping @everyone (requires the bot to have the Mention Everyone permission).",
+            },
           },
           required: ["channel", "message"],
         },
       },
       {
         name: "read-messages",
-        description: "Read recent messages from a Discord channel",
+        description: "Read messages from a Discord channel. Each message includes author ID, reply reference, and mentions. Supports pagination (limit up to 1000) and before/after/since/until/author filters for full-history analysis.",
         inputSchema: {
           type: "object",
           properties: {
@@ -207,11 +345,75 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             limit: {
               type: "number",
-              description: "Number of messages to fetch (max 100)",
+              description: "Max messages to return (up to 1000; values over 100 are paginated automatically)",
               default: 50,
+            },
+            before: {
+              type: "string",
+              description: "Only messages older than this message ID (cursor for paging back through history)",
+            },
+            after: {
+              type: "string",
+              description: "Only messages newer than this message ID",
+            },
+            since: {
+              type: "string",
+              description: 'Only messages at/after this ISO 8601 timestamp, e.g. "2025-06-01T00:00:00Z"',
+            },
+            until: {
+              type: "string",
+              description: "Only messages at/before this ISO 8601 timestamp",
+            },
+            author: {
+              type: "string",
+              description: "Filter to a single author (ID, username, tag, or nickname)",
             },
           },
           required: ["channel"],
+        },
+      },
+      {
+        name: "search-messages",
+        description: "Keyword-search messages in a channel (or across all readable channels in a server). Space-separated terms must all appear. Returns matches with author IDs and timestamps.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            server: {
+              type: "string",
+              description: 'Server name or ID (optional if bot is only in one server)',
+            },
+            channel: {
+              type: "string",
+              description: "Channel name or ID to search. Omit to search all readable text channels in the server.",
+            },
+            query: {
+              type: "string",
+              description: "Keyword(s) to find. Space-separated terms must ALL appear (case-insensitive).",
+            },
+            limit: {
+              type: "number",
+              description: "Max matching messages to return",
+              default: 25,
+            },
+            author: {
+              type: "string",
+              description: "Restrict to a single author (ID, username, tag, or nickname)",
+            },
+            since: {
+              type: "string",
+              description: "Only search messages at/after this ISO 8601 timestamp",
+            },
+            until: {
+              type: "string",
+              description: "Only search messages at/before this ISO 8601 timestamp",
+            },
+            maxScanPerChannel: {
+              type: "number",
+              description: "Max messages to scan per channel before giving up",
+              default: 1000,
+            },
+          },
+          required: ["query"],
         },
       },
       {
@@ -321,22 +523,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "read-messages": {
-        const { server: guildIdentifier, channel: channelIdentifier, limit } = ReadMessagesSchema.parse(args);
+        const { server: guildIdentifier, channel: channelIdentifier, limit, before, after, since, until, author } = ReadMessagesSchema.parse(args);
         const channel = await findChannel(channelIdentifier, guildIdentifier);
-        
-        const messages = await channel.messages.fetch({ limit });
-        const formattedMessages = Array.from(messages.values()).map(msg => ({
-          channel: `#${channel.name}`,
-          server: channel.guild.name,
-          author: msg.author.tag,
-          content: msg.content,
-          timestamp: msg.createdAt.toISOString(),
-        }));
+
+        const { messages, scanned, hitScanCap } = await collectMessages(channel, {
+          limit, before, after, since, until, author,
+          // Scan deeper when filtering (matches may be sparse); otherwise scan
+          // only as far as needed to return `limit` messages.
+          maxScan: (author || since || after) ? 3000 : Math.max(limit, 100),
+        });
+
+        const payload: any = { count: messages.length, messages };
+        if (hitScanCap) {
+          payload.note = `Stopped after scanning ${scanned} messages (safety cap). Narrow with since/until/author, or page further back using 'before' with the oldest message id.`;
+        }
 
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(formattedMessages, null, 2),
+            text: JSON.stringify(payload, null, 2),
+          }],
+        };
+      }
+
+      case "search-messages": {
+        const { server: guildIdentifier, channel: channelIdentifier, query, limit, author, since, until, maxScanPerChannel } = SearchMessagesSchema.parse(args);
+        const guild = await findGuild(guildIdentifier);
+
+        const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+        const contentMatch = (content: string) => {
+          const lc = content.toLowerCase();
+          return terms.every(t => lc.includes(t));
+        };
+
+        const channels = channelIdentifier
+          ? [await findChannel(channelIdentifier, guildIdentifier)]
+          : [...guild.channels.cache.filter((c): c is TextChannel => c instanceof TextChannel).values()];
+
+        const matches: ReturnType<typeof formatMessage>[] = [];
+        const channelsScanned: { channel: string; scanned: number; matched: number; hitScanCap: boolean; error?: string }[] = [];
+
+        for (const ch of channels) {
+          if (matches.length >= limit) break;
+          try {
+            const { messages, scanned, hitScanCap } = await collectMessages(ch, {
+              limit: limit - matches.length,
+              author, since, until, contentMatch,
+              maxScan: maxScanPerChannel,
+            });
+            matches.push(...messages);
+            channelsScanned.push({ channel: `#${ch.name}`, scanned, matched: messages.length, hitScanCap });
+          } catch (e) {
+            // Skip channels the bot can't read (missing permissions, etc.).
+            channelsScanned.push({ channel: `#${ch.name}`, scanned: 0, matched: 0, hitScanCap: false, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              query,
+              totalMatches: matches.length,
+              matches,
+              channelsScanned,
+              note: "Keyword (substring) search over recent history. Increase maxScanPerChannel to look further back; channels showing hitScanCap=true may have older matches.",
+            }, null, 2),
           }],
         };
       }
